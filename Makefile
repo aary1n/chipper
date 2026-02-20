@@ -47,6 +47,10 @@ train:
 	@echo "Training model with walk-forward CV"
 	python scripts/train.py --symbol $(SYMBOL)
 
+train-smoke:
+	@echo "Smoke-test training with minimal data (1 train day, no embargo)"
+	python scripts/train.py --symbol $(SYMBOL) --min-train-days 1 --embargo-days 0
+
 replay:
 	@echo "Replaying Parquet through signal + taker sim"
 	python scripts/replay.py --symbol $(SYMBOL)
