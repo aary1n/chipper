@@ -199,6 +199,23 @@ def _trade_arrow_schema() -> pa.Schema:
 
 # ── File-level normalisation ───────────────────────────────────────────────────
 
+def _parse_stem(stem: str) -> tuple[str, str, str]:
+    """
+    Parse NDJSON filename stem: BTCUSDT_20260220_17
+    Returns (symbol, date_str, hour_str).  date_str format: YYYY-MM-DD.
+    """
+    parts = stem.split("_")
+    symbol = parts[0] if parts else "UNKNOWN"
+    date_str = ""
+    hour_str = "00"
+    if len(parts) >= 3:
+        raw_date = parts[-2]           # e.g. "20260220"
+        hour_str = parts[-1]           # e.g. "17"
+        if len(raw_date) == 8:
+            date_str = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:]}"
+    return symbol, date_str, hour_str
+
+
 def normalise_file(
     ndjson_path: Path,
     processed_dir: Path,
@@ -208,15 +225,20 @@ def normalise_file(
     Read one NDJSON file, reconstruct book, write Parquet partitions.
 
     Returns (snapshot_rows_written, trade_rows_written).
-    Partition path: {processed_dir}/{table}/symbol={sym}/date={date}/part-0.parquet
+    Partition path: {processed_dir}/{table}/symbol={sym}/date={date}/{stem}.parquet
+
+    Part filename equals the NDJSON stem (e.g. BTCUSDT_20260220_17.parquet) so
+    multiple hourly files for the same date never overwrite each other.
     """
     ndjson_path = Path(ndjson_path)
     processed_dir = Path(processed_dir)
 
-    reconstructor = BookReconstructor(symbol="", depth=depth)
+    stem = ndjson_path.stem  # e.g. BTCUSDT_20260220_17
+    sym_from_name, date_str, _ = _parse_stem(stem)
+
+    reconstructor = BookReconstructor(symbol=sym_from_name, depth=depth)
     snap_rows: list[dict] = []
     trade_rows: list[dict] = []
-    date_str: str = ""
 
     with open(ndjson_path, encoding="utf-8") as fh:
         for line in fh:
@@ -232,18 +254,7 @@ def normalise_file(
             etype = event.get("type")
 
             if etype == "snapshot":
-                # REST snapshot — update symbol and load state
-                if not reconstructor.symbol:
-                    # Infer symbol from filename: BTCUSDT_20240101_00.ndjson
-                    stem = ndjson_path.stem  # e.g. BTCUSDT_20240101_00
-                    reconstructor.symbol = stem.split("_")[0]
                 reconstructor.apply_snapshot(event)
-                local_us: int = event.get("timestamp_local_us", 0)
-                if not date_str and local_us:
-                    from datetime import datetime, timezone
-                    date_str = datetime.fromtimestamp(
-                        local_us / 1_000_000, tz=timezone.utc
-                    ).strftime("%Y-%m-%d")
 
             elif etype == "depth":
                 # Depth diff — apply and emit snapshot row
@@ -285,16 +296,17 @@ def normalise_file(
         return 0, 0
 
     sym = reconstructor.symbol or "UNKNOWN"
+    part_name = f"{stem}.parquet"  # e.g. BTCUSDT_20260220_17.parquet — unique per source file
 
     # Write snapshots
     if snap_rows:
         snap_df = pl.DataFrame(snap_rows)
-        _write_partition(snap_df, "snapshots", sym, date_str, processed_dir)
+        _write_partition(snap_df, "snapshots", sym, date_str, processed_dir, part_name)
 
     # Write trades
     if trade_rows:
         trade_df = pl.DataFrame(trade_rows)
-        _write_partition(trade_df, "trades", sym, date_str, processed_dir)
+        _write_partition(trade_df, "trades", sym, date_str, processed_dir, part_name)
 
     logger.info(
         "[%s %s] Normalised %s → %d snapshots, %d trades",
@@ -309,10 +321,11 @@ def _write_partition(
     symbol: str,
     date: str,
     processed_dir: Path,
+    part_name: str = "part-0.parquet",
 ) -> None:
     out_dir = processed_dir / table / f"symbol={symbol}" / f"date={date}"
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "part-0.parquet"
+    out_path = out_dir / part_name
     df.write_parquet(out_path, compression="snappy")
     logger.debug("Wrote %s → %s (%d rows)", table, out_path, len(df))
 
