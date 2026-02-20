@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chipper"
+version = "0.1.0"
+description = "LOB Alpha — Limit Order Book Microstructure Research Engine"
+requires-python = ">=3.11"
+dependencies = [
+    "polars>=0.20",
+    "duckdb>=0.9",
+    "pyarrow>=14",
+    "websockets>=12",
+    "aiohttp>=3.9",
+    "pydantic-settings>=2.0",
+    "numpy>=1.26",
+    "scikit-learn>=1.4",
+    "click>=8.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=4",
+    "ruff>=0.3",
+]
+viz = [
+    "plotly>=5",
+    "matplotlib>=3.8",
+]
+ml = [
+    "lightgbm>=4",
+    "wandb>=0.16",
+    "shap>=0.44",
+]
+
+[project.scripts]
+chipper-record    = "scripts.record:main"
+chipper-normalise = "scripts.normalise:main"
+chipper-build     = "scripts.build_dataset:main"
+chipper-train     = "scripts.train:main"
+chipper-replay    = "scripts.replay:main"
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+addopts = "-v --tb=short"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["config", "warehouse", "ingest", "features", "models", "analysis", "backtest"]

@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+.env
+*.env
+
+# Data (never commit raw or processed data)
+data/raw/
+data/processed/
+data/external/
+*.ndjson
+*.parquet
+*.duckdb
+
+# Models
+models/
+
+# Logs
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# W&B
+wandb/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Docs build
+docs/_build/
+
+# Claude context (session-local docs, not for repo)
+CLAUDE.md
+.claude/
