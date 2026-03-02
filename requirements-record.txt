@@ -1,0 +1,7 @@
+# Minimal deps for scripts/record.py on a remote VPS.
+# Install with: pip install -r requirements-record.txt
+# No polars / duckdb / numpy / sklearn needed — recorder is websocket + file I/O only.
+websockets>=12
+aiohttp>=3.9
+pydantic-settings>=2.0
+click>=8.1
