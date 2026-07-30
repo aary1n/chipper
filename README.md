@@ -1,4 +1,4 @@
-# LOB Alpha — chipper
+# chipper
 
 A limit order book microstructure research engine for Binance Spot data.
 
