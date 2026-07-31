@@ -16,6 +16,7 @@ env/
 *.env
 
 # Data (never commit raw or processed data)
+/data/
 data/raw/
 data/processed/
 data/external/
@@ -23,8 +24,8 @@ data/external/
 *.parquet
 *.duckdb
 
-# Models
-models/
+# Models (trained artifacts at repo root — NOT src/models)
+/models/
 
 # Logs
 logs/
