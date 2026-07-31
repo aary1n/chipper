@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import asdict, dataclass
 from enum import Enum, auto
 from pathlib import Path
 
@@ -166,6 +167,23 @@ class BookReconstructor:
         self._last_update_id = None
         self.is_clean = False
 
+    def to_state(self) -> dict:
+        """Serializable snapshot of reconstruction state (checkpoint/resume)."""
+        return {
+            "bids": [[p, q] for p, q in self._bids.items()],
+            "asks": [[p, q] for p, q in self._asks.items()],
+            "last_update_id": self._last_update_id,
+            "is_clean": self.is_clean,
+        }
+
+    def load_state(self, state: dict) -> None:
+        """Restore state produced by to_state()."""
+        self._bids = {float(p): float(q) for p, q in state["bids"]}
+        self._asks = {float(p): float(q) for p, q in state["asks"]}
+        lu = state["last_update_id"]
+        self._last_update_id = int(lu) if lu is not None else None
+        self.is_clean = bool(state["is_clean"])
+
 
 # ── Snapshot Parquet schema ────────────────────────────────────────────────────
 
@@ -197,6 +215,31 @@ def _trade_arrow_schema() -> pa.Schema:
     ])
 
 
+# ── Per-file normalisation stats ───────────────────────────────────────────────
+
+@dataclass
+class FileStats:
+    """
+    Skip-and-count accounting for one NDJSON file. Nothing is dropped
+    silently: every line or event that does not become an output row is
+    counted in exactly one of these fields.
+    """
+
+    file: str
+    snapshot_rows: int = 0
+    trade_rows: int = 0
+    malformed_lines: int = 0    # unparseable JSON (e.g. truncation at ENOSPC)
+    invalid_events: int = 0     # parseable JSON with missing/bad fields
+    pre_sync_skipped: int = 0   # depth events before book sync (awaiting snapshot)
+    gaps: int = 0               # sequence gaps detected (next.U > prev.u + 1)
+    out_of_order: int = 0       # stale events detected (next.U < prev.u + 1)
+    gap_markers: int = 0        # explicit gap_marker records from the recorder
+    unknown_type: int = 0       # unrecognised event types
+    first_exchange_us: int | None = None  # E of first emitted snapshot row
+    last_exchange_us: int | None = None   # E of last emitted snapshot row
+    max_interarrival_us: int = 0  # max E-gap between consecutive emitted rows
+
+
 # ── File-level normalisation ───────────────────────────────────────────────────
 
 def _parse_stem(stem: str) -> tuple[str, str, str]:
@@ -220,13 +263,21 @@ def normalise_file(
     ndjson_path: Path,
     processed_dir: Path,
     depth: int = 20,
-) -> tuple[int, int]:
+    reconstructor: BookReconstructor | None = None,
+) -> FileStats:
     """
     Read one NDJSON file, reconstruct book, write Parquet partitions.
 
-    Returns (snapshot_rows_written, trade_rows_written).
-    Partition path: {processed_dir}/{table}/symbol={sym}/date={date}/{stem}.parquet
+    Pass a shared `reconstructor` to continue book state across consecutive
+    hourly files: the recorder writes a `snapshot` event only at session
+    start, so mid-session hourly files have no leading snapshot and would
+    otherwise emit zero rows. If omitted, a fresh reconstructor is used
+    (standalone single-file mode).
 
+    Returns FileStats. Every skipped line or event is counted — nothing is
+    dropped silently. The raw NDJSON is never modified.
+
+    Partition path: {processed_dir}/{table}/symbol={sym}/date={date}/{stem}.parquet
     Part filename equals the NDJSON stem (e.g. BTCUSDT_20260220_17.parquet) so
     multiple hourly files for the same date never overwrite each other.
     """
@@ -236,66 +287,117 @@ def normalise_file(
     stem = ndjson_path.stem  # e.g. BTCUSDT_20260220_17
     sym_from_name, date_str, _ = _parse_stem(stem)
 
-    reconstructor = BookReconstructor(symbol=sym_from_name, depth=depth)
+    rec = reconstructor if reconstructor is not None else BookReconstructor(
+        symbol=sym_from_name, depth=depth
+    )
+    stats = FileStats(file=ndjson_path.name)
     snap_rows: list[dict] = []
     trade_rows: list[dict] = []
+    prev_emit_us: int | None = None
 
     with open(ndjson_path, encoding="utf-8") as fh:
-        for line in fh:
+        for line_no, line in enumerate(fh, start=1):
             line = line.strip()
             if not line:
                 continue
             try:
                 event = json.loads(line)
-            except json.JSONDecodeError:
-                logger.warning("Skipping malformed line in %s", ndjson_path)
+            except json.JSONDecodeError as exc:
+                stats.malformed_lines += 1
+                logger.warning(
+                    "Skipping malformed line %d in %s: %s",
+                    line_no, ndjson_path.name, exc,
+                )
                 continue
 
             etype = event.get("type")
+            try:
+                if etype == "snapshot":
+                    rec.apply_snapshot(event)
 
-            if etype == "snapshot":
-                reconstructor.apply_snapshot(event)
+                elif etype == "depth":
+                    # Depth diff — apply and emit snapshot row
+                    result = rec.apply_delta(event)
+                    if result == ApplyResult.OK:
+                        # E field is in ms; convert to µs
+                        exc_us = int(event.get("E", 0)) * 1000
+                        local_us = int(event.get("timestamp_local_us", 0))
+                        row = rec.top_k_snapshot(exc_us, local_us)
+                        snap_rows.append(row)
+                        if stats.first_exchange_us is None:
+                            stats.first_exchange_us = exc_us
+                        stats.last_exchange_us = exc_us
+                        if prev_emit_us is not None:
+                            stats.max_interarrival_us = max(
+                                stats.max_interarrival_us, exc_us - prev_emit_us
+                            )
+                        prev_emit_us = exc_us
+                    elif result == ApplyResult.GAP:
+                        stats.gaps += 1
+                        logger.warning(
+                            "[%s] GAP at line %d in %s — resync required.",
+                            rec.symbol, line_no, ndjson_path.name,
+                        )
+                        rec.reset()
+                    elif result == ApplyResult.OUT_OF_ORDER:
+                        stats.out_of_order += 1
+                        logger.warning(
+                            "[%s] OUT_OF_ORDER at line %d in %s — resync required.",
+                            rec.symbol, line_no, ndjson_path.name,
+                        )
+                        rec.reset()
+                    else:  # NOT_SYNCED: awaiting snapshot after gap/session start
+                        stats.pre_sync_skipped += 1
 
-            elif etype == "depth":
-                # Depth diff — apply and emit snapshot row
-                result = reconstructor.apply_delta(event)
-                if result == ApplyResult.OK:
-                    # E field is in ms; convert to µs
-                    exc_us = int(event.get("E", 0)) * 1000
-                    local_us = int(event.get("timestamp_local_us", 0))
-                    row = reconstructor.top_k_snapshot(exc_us, local_us)
-                    snap_rows.append(row)
-                elif result in (ApplyResult.GAP, ApplyResult.OUT_OF_ORDER):
+                elif etype == "trade":
+                    # Trade — extract and pass through
+                    side = "sell" if event.get("m") else "buy"
+                    trade_rows.append({
+                        "timestamp_exchange_us": int(event.get("E", 0)) * 1000,
+                        "timestamp_trade_us": int(event.get("T", 0)) * 1000,
+                        "timestamp_local_us": int(event.get("timestamp_local_us", 0)),
+                        "symbol": rec.symbol,
+                        "side": side,
+                        "price": float(event.get("p", 0)),
+                        "quantity": float(event.get("q", 0)),
+                        "trade_id": int(event.get("t", 0)),
+                    })
+
+                elif etype == "gap_marker":
+                    # Explicit gap from recorder — ensure state is reset
+                    stats.gap_markers += 1
+                    rec.reset()
+
+                else:
+                    stats.unknown_type += 1
                     logger.warning(
-                        "[%s] %s — resync required. Rows so far: %d",
-                        reconstructor.symbol, result.name, len(snap_rows),
+                        "Unknown event type %r at line %d in %s",
+                        etype, line_no, ndjson_path.name,
                     )
-                    reconstructor.reset()
-                # NOT_SYNCED: no snapshot yet, skip
+            except (KeyError, ValueError, TypeError) as exc:
+                stats.invalid_events += 1
+                logger.warning(
+                    "Skipping invalid %r event at line %d in %s: %s",
+                    etype, line_no, ndjson_path.name, exc,
+                )
+                if etype == "depth":
+                    # A depth event may have partially applied — book state is
+                    # no longer trustworthy until the next snapshot.
+                    rec.reset()
 
-            elif etype == "trade":
-                # Trade — extract and pass through
-                side = "sell" if event.get("m") else "buy"
-                trade_rows.append({
-                    "timestamp_exchange_us": int(event.get("E", 0)) * 1000,
-                    "timestamp_trade_us": int(event.get("T", 0)) * 1000,
-                    "timestamp_local_us": int(event.get("timestamp_local_us", 0)),
-                    "symbol": reconstructor.symbol,
-                    "side": side,
-                    "price": float(event.get("p", 0)),
-                    "quantity": float(event.get("q", 0)),
-                    "trade_id": int(event.get("t", 0)),
-                })
-
-            elif etype == "gap_marker":
-                # Explicit gap from recorder — ensure state is reset
-                reconstructor.reset()
+    stats.snapshot_rows = len(snap_rows)
+    stats.trade_rows = len(trade_rows)
 
     if not date_str:
-        logger.warning("Could not determine date for %s — skipping write.", ndjson_path)
-        return 0, 0
+        logger.warning(
+            "Could not determine date for %s — dropping %d snapshot / %d trade rows.",
+            ndjson_path, len(snap_rows), len(trade_rows),
+        )
+        stats.snapshot_rows = 0
+        stats.trade_rows = 0
+        return stats
 
-    sym = reconstructor.symbol or "UNKNOWN"
+    sym = rec.symbol or "UNKNOWN"
     part_name = f"{stem}.parquet"  # e.g. BTCUSDT_20260220_17.parquet — unique per source file
 
     # Write snapshots
@@ -309,10 +411,13 @@ def normalise_file(
         _write_partition(trade_df, "trades", sym, date_str, processed_dir, part_name)
 
     logger.info(
-        "[%s %s] Normalised %s → %d snapshots, %d trades",
+        "[%s %s] Normalised %s → %d snapshots, %d trades "
+        "(malformed=%d invalid=%d pre_sync=%d gaps=%d ooo=%d markers=%d)",
         sym, date_str, ndjson_path.name, len(snap_rows), len(trade_rows),
+        stats.malformed_lines, stats.invalid_events, stats.pre_sync_skipped,
+        stats.gaps, stats.out_of_order, stats.gap_markers,
     )
-    return len(snap_rows), len(trade_rows)
+    return stats
 
 
 def _write_partition(
@@ -332,32 +437,129 @@ def _write_partition(
 
 # ── Batch normalisation ────────────────────────────────────────────────────────
 
+_STAT_TOTAL_FIELDS = (
+    "snapshot_rows", "trade_rows", "malformed_lines", "invalid_events",
+    "pre_sync_skipped", "gaps", "out_of_order", "gap_markers", "unknown_type",
+)
+
+_CHECKPOINT_NAME = "_normalise_checkpoint.json"
+
+
+def _write_checkpoint(
+    processed_dir: Path,
+    symbol: str,
+    depth: int,
+    stats_list: list[FileStats],
+    rec: BookReconstructor,
+) -> None:
+    """Persist resume state after a completed file. Atomic replace so an
+    interruption can never leave a torn checkpoint."""
+    payload = {
+        "symbol": symbol.upper(),
+        "depth": depth,
+        "last_completed_file": stats_list[-1].file,
+        "reconstructor": rec.to_state(),
+        "stats_so_far": [asdict(s) for s in stats_list],
+    }
+    path = processed_dir / _CHECKPOINT_NAME
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _load_checkpoint(processed_dir: Path, symbol: str, depth: int) -> dict | None:
+    """Load a resume checkpoint if present and compatible, else None."""
+    path = processed_dir / _CHECKPOINT_NAME
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        logger.warning("Corrupt checkpoint %s — ignoring, starting fresh.", path)
+        return None
+    if payload.get("symbol") != symbol.upper() or payload.get("depth") != depth:
+        logger.warning(
+            "Checkpoint %s is for symbol=%s depth=%s (want %s/%d) — ignoring.",
+            path, payload.get("symbol"), payload.get("depth"), symbol.upper(), depth,
+        )
+        return None
+    return payload
+
+
 def normalise_directory(
     raw_dir: Path,
     processed_dir: Path,
     symbol: str,
     depth: int = 20,
-) -> tuple[int, int]:
+    resume: bool = True,
+) -> list[FileStats]:
     """
-    Normalise all NDJSON files for a symbol in raw_dir.
-    Returns total (snapshot_rows, trade_rows).
+    Normalise all NDJSON files for a symbol in raw_dir, in chronological
+    (filename) order, threading a single BookReconstructor across files so
+    book state survives hourly-file boundaries. Sequence continuity is
+    enforced across boundaries too: a discontinuity between files is
+    detected as a gap exactly like an intra-file one.
+
+    A checkpoint (`_normalise_checkpoint.json`) is written after every
+    completed file; with resume=True (default) an interrupted run picks up
+    exactly where it stopped, restoring the reconstructor's book state.
+    The checkpoint is deleted on successful completion.
+
+    Returns per-file FileStats. Also writes `_normalise_report.json`
+    (per-file stats + totals) into processed_dir.
     """
     raw_dir = Path(raw_dir)
+    processed_dir = Path(processed_dir)
     pattern = f"{symbol.upper()}_*.ndjson"
     files = sorted(raw_dir.glob(pattern))
 
     if not files:
         logger.warning("No NDJSON files found for pattern: %s/%s", raw_dir, pattern)
-        return 0, 0
+        return []
 
-    total_snaps = total_trades = 0
+    processed_dir.mkdir(parents=True, exist_ok=True)
+    rec = BookReconstructor(symbol=symbol, depth=depth)
+    all_stats: list[FileStats] = []
+
+    ckpt = _load_checkpoint(processed_dir, symbol, depth) if resume else None
+    if ckpt is not None:
+        done = ckpt["last_completed_file"]
+        remaining = [f for f in files if f.name > done]
+        rec.load_state(ckpt["reconstructor"])
+        all_stats = [FileStats(**s) for s in ckpt["stats_so_far"]]
+        logger.info(
+            "Resuming after %s — %d file(s) already done, %d remaining.",
+            done, len(all_stats), len(remaining),
+        )
+        files = remaining
+
     for f in files:
-        s, t = normalise_file(f, processed_dir, depth=depth)
-        total_snaps += s
-        total_trades += t
+        all_stats.append(normalise_file(f, processed_dir, depth=depth, reconstructor=rec))
+        _write_checkpoint(processed_dir, symbol, depth, all_stats, rec)
+
+    totals = {
+        k: sum(getattr(s, k) for s in all_stats) for k in _STAT_TOTAL_FIELDS
+    }
+    report = {
+        "symbol": symbol.upper(),
+        "raw_dir": str(raw_dir),
+        "depth": depth,
+        "n_files": len(files),
+        "totals": totals,
+        "files": [asdict(s) for s in all_stats],
+    }
+    report_path = processed_dir / "_normalise_report.json"
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    # Run completed — the mid-run checkpoint is no longer needed.
+    (processed_dir / _CHECKPOINT_NAME).unlink(missing_ok=True)
 
     logger.info(
-        "Normalised %d files → %d snapshot rows, %d trade rows",
-        len(files), total_snaps, total_trades,
+        "Normalised %d files → %d snapshot rows, %d trade rows "
+        "(skipped: %d malformed, %d invalid; anomalies: %d gaps, %d ooo, "
+        "%d gap_markers). Report: %s",
+        len(files), totals["snapshot_rows"], totals["trade_rows"],
+        totals["malformed_lines"], totals["invalid_events"],
+        totals["gaps"], totals["out_of_order"], totals["gap_markers"],
+        report_path,
     )
-    return total_snaps, total_trades
+    return all_stats

@@ -12,10 +12,16 @@ Critical invariants tested (DATA_CONTRACTS.md §Sequence Integrity):
   8. Post-resync deltas apply correctly.
 """
 
+import json
+
 import pytest
 
-from ingest.lob_normaliser import ApplyResult, BookReconstructor
-
+from ingest.lob_normaliser import (
+    ApplyResult,
+    BookReconstructor,
+    normalise_directory,
+    normalise_file,
+)
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -316,3 +322,149 @@ def test_reset_clears_state(snapshot_raw):
     assert not rec.is_clean
     assert rec._bids == {}
     assert rec._asks == {}
+
+
+# ── 11. File-level normalisation: skip-and-count + cross-file state ───────────
+
+_SNAPSHOT_LINE = {
+    "type": "snapshot", "lastUpdateId": 100,
+    "bids": [["50000.00", "1.0"], ["49999.00", "2.0"]],
+    "asks": [["50001.00", "1.5"]],
+    "timestamp_local_us": 1,
+}
+_DEPTH_101 = {
+    "type": "depth", "e": "depthUpdate", "E": 1700000000000,
+    "U": 101, "u": 103, "b": [["50000.00", "1.5"]], "a": [],
+    "timestamp_local_us": 2,
+}
+_DEPTH_104 = {
+    "type": "depth", "e": "depthUpdate", "E": 1700000000100,
+    "U": 104, "u": 106, "b": [], "a": [["50001.00", "1.0"]],
+    "timestamp_local_us": 3,
+}
+_DEPTH_GAP_110 = {
+    "type": "depth", "e": "depthUpdate", "E": 1700000000200,
+    "U": 110, "u": 112, "b": [], "a": [],
+    "timestamp_local_us": 4,
+}
+
+
+def _write_ndjson(path, events):
+    with open(path, "w", encoding="utf-8") as fh:
+        for evt in events:
+            if isinstance(evt, str):
+                fh.write(evt + "\n")  # raw line, e.g. truncated JSON
+            else:
+                fh.write(json.dumps(evt) + "\n")
+
+
+def test_normalise_file_counts_malformed(tmp_path):
+    """A truncated/unparseable line is skipped AND counted, never silent."""
+    raw = tmp_path / "BTCUSDT_20260310_00.ndjson"
+    _write_ndjson(raw, [_SNAPSHOT_LINE, _DEPTH_101, '{"type":"depth","E":170'])
+    stats = normalise_file(raw, tmp_path / "out")
+    assert stats.malformed_lines == 1
+    assert stats.snapshot_rows == 1
+
+
+def test_normalise_file_counts_invalid_event(tmp_path):
+    """A parseable depth event missing required fields is counted as invalid."""
+    raw = tmp_path / "BTCUSDT_20260310_00.ndjson"
+    bad_depth = {"type": "depth", "U": 101, "timestamp_local_us": 2}  # no "u"
+    _write_ndjson(raw, [_SNAPSHOT_LINE, bad_depth])
+    stats = normalise_file(raw, tmp_path / "out")
+    assert stats.invalid_events == 1
+    assert stats.snapshot_rows == 0
+
+
+def test_directory_state_continues_across_files(tmp_path):
+    """Mid-session hourly files have no leading snapshot; book state must
+    carry over from the previous file (recorder snapshots only at session
+    start)."""
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    _write_ndjson(raw_dir / "BTCUSDT_20260310_00.ndjson", [_SNAPSHOT_LINE, _DEPTH_101])
+    _write_ndjson(raw_dir / "BTCUSDT_20260310_01.ndjson", [_DEPTH_104])
+
+    all_stats = normalise_directory(raw_dir, tmp_path / "out", symbol="BTCUSDT")
+    assert len(all_stats) == 2
+    assert all_stats[0].snapshot_rows == 1
+    # Second file emits its row despite having no snapshot event
+    assert all_stats[1].snapshot_rows == 1
+    assert all_stats[1].pre_sync_skipped == 0
+    assert all_stats[1].gaps == 0
+
+
+def test_directory_detects_gap_at_file_boundary(tmp_path):
+    """A sequence discontinuity between files is a gap, exactly like an
+    intra-file one; rows resume only after the next snapshot event."""
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    resync = {**_SNAPSHOT_LINE, "lastUpdateId": 200}
+    post = {**_DEPTH_101, "U": 201, "u": 205}
+    _write_ndjson(raw_dir / "BTCUSDT_20260310_00.ndjson", [_SNAPSHOT_LINE, _DEPTH_101])
+    _write_ndjson(raw_dir / "BTCUSDT_20260310_01.ndjson", [_DEPTH_GAP_110, resync, post])
+
+    all_stats = normalise_directory(raw_dir, tmp_path / "out", symbol="BTCUSDT")
+    assert all_stats[1].gaps == 1
+    assert all_stats[1].snapshot_rows == 1  # only the post-resync row
+
+
+def test_reconstructor_state_roundtrip(snapshot_raw, delta_valid_1):
+    """to_state()/load_state() preserve book, sync, and sequence position."""
+    rec = make_reconstructor()
+    rec.apply_snapshot(snapshot_raw)
+    rec.apply_delta(delta_valid_1)
+
+    clone = make_reconstructor()
+    clone.load_state(rec.to_state())
+    assert clone.is_synced and clone.is_clean
+    assert clone._last_update_id == 103
+    assert clone._bids == rec._bids
+    assert clone._asks == rec._asks
+    # The next in-sequence delta applies cleanly on the restored state
+    assert clone.apply_delta({"U": 104, "u": 106, "b": [], "a": []}) == ApplyResult.OK
+
+
+def test_directory_resume_skips_done_and_restores_state(tmp_path):
+    """After an interruption, resume skips completed files and continues with
+    the restored book state — the next file needs no snapshot event."""
+    from ingest.lob_normaliser import BookReconstructor, _write_checkpoint
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    out = tmp_path / "out"
+    out.mkdir()
+    _write_ndjson(raw_dir / "BTCUSDT_20260310_00.ndjson", [_SNAPSHOT_LINE, _DEPTH_101])
+    _write_ndjson(raw_dir / "BTCUSDT_20260310_01.ndjson", [_DEPTH_104])  # no snapshot
+
+    # Simulate a run interrupted after file 00: process it, checkpoint, stop.
+    rec = BookReconstructor("BTCUSDT", depth=20)
+    stats0 = normalise_file(
+        raw_dir / "BTCUSDT_20260310_00.ndjson", out, depth=20, reconstructor=rec
+    )
+    _write_checkpoint(out, "BTCUSDT", 20, [stats0], rec)
+
+    all_stats = normalise_directory(raw_dir, out, symbol="BTCUSDT", depth=20)
+    assert [s.file for s in all_stats] == [
+        "BTCUSDT_20260310_00.ndjson",
+        "BTCUSDT_20260310_01.ndjson",
+    ]
+    # File 01 was processed live with restored state: row emitted, no pre-sync
+    assert all_stats[1].snapshot_rows == 1
+    assert all_stats[1].pre_sync_skipped == 0
+    # Completion clears the checkpoint and writes the final report
+    assert not (out / "_normalise_checkpoint.json").exists()
+    assert (out / "_normalise_report.json").exists()
+
+
+def test_directory_writes_report(tmp_path):
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    _write_ndjson(raw_dir / "BTCUSDT_20260310_00.ndjson", [_SNAPSHOT_LINE, _DEPTH_101])
+    out = tmp_path / "out"
+    normalise_directory(raw_dir, out, symbol="BTCUSDT")
+    report = json.loads((out / "_normalise_report.json").read_text(encoding="utf-8"))
+    assert report["n_files"] == 1
+    assert report["totals"]["snapshot_rows"] == 1
+    assert report["files"][0]["file"] == "BTCUSDT_20260310_00.ndjson"
