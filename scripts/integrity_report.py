@@ -43,7 +43,22 @@ def _fmt_dur(us: int) -> str:
     s = us / 1_000_000
     if s < 120:
         return f"{s:.1f}s"
-    return f"{s / 60:.1f}min"
+    if s < 7200:
+        return f"{s / 60:.1f}min"
+    return f"{s / 3600:.2f}h"
+
+
+# Fields this audit renders. If the normaliser stops emitting any of them,
+# refuse to run rather than print zeros for stats that were never counted —
+# a silently green audit is worse than no audit.
+_TOTAL_KEYS = (
+    "snapshot_rows", "trade_rows", "malformed_lines", "invalid_events",
+    "pre_sync_skipped", "gaps", "out_of_order", "gap_markers", "unknown_type",
+)
+_PER_FILE_KEYS = (
+    "file", "snapshot_rows", "max_interarrival_us",
+    "malformed_lines", "invalid_events", "gaps", "out_of_order",
+)
 
 
 @click.command()
@@ -62,6 +77,9 @@ def main(
     """Audit normalised data integrity; write a markdown report."""
     settings.configure_logging()
     log = logging.getLogger("integrity_report")
+    # The report contains non-cp1252 glyphs (→, ⚠); the Windows console
+    # default encoding would crash the final echo after the file is written.
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     sym = (symbol or settings.symbol).upper()
     src = Path(processed_dir) if processed_dir else settings.processed_dir
@@ -77,6 +95,16 @@ def main(
         norm = json.loads(report_json.read_text(encoding="utf-8"))
         per_file = norm.get("files", [])
         t = norm.get("totals", {})
+        missing = [k for k in _TOTAL_KEYS if k not in t]
+        missing += sorted({
+            f"files[].{k}" for f in per_file for k in _PER_FILE_KEYS if k not in f
+        })
+        if missing:
+            raise SystemExit(
+                f"{report_json} is missing expected fields: {', '.join(missing)}"
+                " — the normaliser and this audit have drifted. Refusing to"
+                " render zeros for stats that were never counted."
+            )
         lines += [
             "## Normaliser totals (skip-and-count)",
             "",
@@ -122,7 +150,13 @@ def main(
         lines.append("")
 
     # ── 3. Timeline holes across the whole snapshots table ─────────────────────
-    snap_pattern = str(src / "snapshots" / f"symbol={sym}" / "date=*" / "*.parquet")
+    snap_root = src / "snapshots" / f"symbol={sym}"
+    if not any(snap_root.glob("date=*/*.parquet")):
+        raise SystemExit(
+            f"No snapshot Parquet under {snap_root} — nothing to audit."
+            " Run scripts/normalise.py first (check --symbol/--processed-dir)."
+        )
+    snap_pattern = str(snap_root / "date=*" / "*.parquet")
     ts = (
         pl.scan_parquet(snap_pattern, hive_partitioning=True)
         .select("timestamp_exchange_us")
@@ -143,6 +177,11 @@ def main(
     )
     t0, t1 = full["t0"][0], full["t1"][0]
     n_rows, n_dirty = full["n"][0], full["n_dirty"][0]
+    if n_rows == 0 or t0 is None:
+        raise SystemExit(
+            f"Snapshot Parquet under {snap_root} matched files but contains"
+            " zero rows — nothing to audit."
+        )
 
     lines += [
         "## Snapshot timeline",
