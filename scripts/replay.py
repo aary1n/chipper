@@ -79,7 +79,10 @@ def main(
         df = (
             pl.scan_parquet(pattern, hive_partitioning=True)
             .filter(pl.col("is_clean"))
-            .select(feature_cols + ["timestamp_exchange_us", "bid_prices", "ask_prices"])
+            .select(
+                feature_cols
+                + ["timestamp_exchange_us", "session_id", "best_bid", "best_ask"]
+            )
             .drop_nulls()
             .collect()
             .sort("timestamp_exchange_us")
@@ -99,19 +102,29 @@ def main(
     X_scaled = scaler.transform(X)
     prob_up = model.predict_proba(X_scaled)[:, 1]
 
-    # Taker-only simulation
-    positions: list[dict] = []
+    # Taker-only simulation. A position is never held across a session
+    # boundary — exiting "holding_rows later" across a capture hole would
+    # price the exit against a book from a different market state.
     pnl_per_trade: list[float] = []
+    n_boundary_skipped = 0
+
+    session_ids = df["session_id"].to_numpy()
+    best_bid = df["best_bid"].to_numpy()
+    best_ask = df["best_ask"].to_numpy()
 
     i = 0
     n = len(df)
     while i < n - holding_rows:
         p = prob_up[i]
         if p >= threshold:
-            # Go long: buy at ask, sell at ask+holding
-            entry_ask = df["ask_prices"][i][0]
-            exit_bid = df["bid_prices"][i + holding_rows][0]
-            if entry_ask is None or exit_bid is None:
+            if session_ids[i] != session_ids[i + holding_rows]:
+                n_boundary_skipped += 1
+                i += 1
+                continue
+            # Go long: buy at ask, sell at bid holding_rows later
+            entry_ask = best_ask[i]
+            exit_bid = best_bid[i + holding_rows]
+            if np.isnan(entry_ask) or np.isnan(exit_bid):
                 i += 1
                 continue
             entry_fee = entry_ask * fee / 10_000
@@ -121,6 +134,12 @@ def main(
             i += holding_rows  # skip forward
         else:
             i += 1
+
+    if n_boundary_skipped:
+        log.info(
+            "Skipped %d signal(s) at session boundaries (no cross-gap holds).",
+            n_boundary_skipped,
+        )
 
     if not pnl_per_trade:
         log.warning("No trades generated. Try lowering --threshold.")
