@@ -38,6 +38,29 @@ DEFAULT_FEATURES = [
 ]
 
 
+def _parse_segment(spec: str):
+    """
+    Parse a segment spec "NAME=START/END" with ISO-8601 UTC bounds, e.g.
+    "A=2026-03-02T20:00/2026-03-06T09:00". Bounds are [start, end).
+    """
+    from datetime import datetime, timezone
+
+    from models.train import Segment
+
+    name, _, rng = spec.partition("=")
+    start_s, _, end_s = rng.partition("/")
+    if not (name and start_s and end_s):
+        raise click.BadParameter(f"Segment spec must be NAME=START/END, got {spec!r}")
+
+    def to_us(s: str) -> int:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1_000_000)
+
+    return Segment(name=name, start_us=to_us(start_s), end_us=to_us(end_s))
+
+
 @click.command()
 @click.option("--symbol", default=None)
 @click.option("--features-dir", default=None, type=click.Path())
@@ -45,6 +68,12 @@ DEFAULT_FEATURES = [
 @click.option("--min-train-days", default=3, type=int)
 @click.option("--embargo-days", default=1, type=int)
 @click.option("--wandb/--no-wandb", default=None, help="Override W&B setting")
+@click.option(
+    "--segment", "segment_specs", multiple=True,
+    help='Recording segment "NAME=ISO_START/ISO_END" (UTC, end-exclusive). '
+         "Repeatable. Walk-forward runs per segment; no fold crosses a "
+         "boundary. Omit to treat all data as one segment.",
+)
 def main(
     symbol: str | None,
     features_dir: str | None,
@@ -52,6 +81,7 @@ def main(
     min_train_days: int,
     embargo_days: int,
     wandb: bool | None,
+    segment_specs: tuple[str, ...],
 ) -> None:
     """Train logistic regression baseline with purged walk-forward CV."""
     settings.configure_logging()
@@ -60,10 +90,13 @@ def main(
     sym = (symbol or settings.symbol).upper()
     feat_dir = Path(features_dir) if features_dir else settings.features_dir
     use_wandb = wandb if wandb is not None else settings.wandb_enabled
+    segments = [_parse_segment(s) for s in segment_specs] or None
 
     log.info(
-        "Walk-forward training: symbol=%s label=%s min_train=%d embargo=%d wandb=%s",
+        "Walk-forward training: symbol=%s label=%s min_train=%d embargo=%d "
+        "wandb=%s segments=%s",
         sym, label_col, min_train_days, embargo_days, use_wandb,
+        [s.name for s in segments] if segments else "single (all data)",
     )
 
     from models.train import run_walk_forward
@@ -76,6 +109,7 @@ def main(
         min_train_days=min_train_days,
         embargo_days=embargo_days,
         wandb_enabled=use_wandb,
+        segments=segments,
     )
 
     if not results:
@@ -105,6 +139,8 @@ def main(
             "feature_cols": DEFAULT_FEATURES,
             "best_fold_auc": best.auc,
             "best_test_date": str(best.test_date),
+            "best_segment": best.segment,
+            "segments": [s for s in segment_specs] or ["all"],
             "n_folds": len(results),
         },
         models_dir=settings.models_dir,
