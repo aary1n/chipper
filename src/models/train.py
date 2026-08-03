@@ -116,11 +116,11 @@ def load_feature_matrix(
     Returns (X, y) as numpy arrays.
     """
     pattern = str(features_dir / f"symbol={symbol}" / "date=*" / "*.parquet")
-    date_strs = {d.isoformat() for d in dates}
 
     lf = (
         pl.scan_parquet(pattern, hive_partitioning=True)
-        .filter(pl.col("date").is_in(date_strs))
+        # hive `date` column is Date-typed; filter with date values, not strings
+        .filter(pl.col("date").is_in(list(dates)))
         .filter(pl.col("is_clean"))
     )
     if time_range_us is not None:
