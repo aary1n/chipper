@@ -544,7 +544,7 @@ def normalise_directory(
         "symbol": symbol.upper(),
         "raw_dir": str(raw_dir),
         "depth": depth,
-        "n_files": len(files),
+        "n_files": len(all_stats),  # cumulative across resumes, like every other total
         "totals": totals,
         "files": [asdict(s) for s in all_stats],
     }
@@ -557,7 +557,7 @@ def normalise_directory(
         "Normalised %d files → %d snapshot rows, %d trade rows "
         "(skipped: %d malformed, %d invalid; anomalies: %d gaps, %d ooo, "
         "%d gap_markers). Report: %s",
-        len(files), totals["snapshot_rows"], totals["trade_rows"],
+        len(all_stats), totals["snapshot_rows"], totals["trade_rows"],
         totals["malformed_lines"], totals["invalid_events"],
         totals["gaps"], totals["out_of_order"], totals["gap_markers"],
         report_path,
